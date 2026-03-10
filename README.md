@@ -90,4 +90,4 @@ For performance-sensitive functions, use `exclude` to skip them, or `disable: Co
 
 ## License
 
-MIT
+Apache License 2.0 — see [LICENSE](LICENSE) for details.

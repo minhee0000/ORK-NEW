@@ -3,6 +3,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <random>
 
 using namespace llvm;
@@ -23,10 +24,15 @@ PreservedAnalyses StringEncryptionPass::run(Module &M,
     }
   }
 
+  SmallVector<EncryptedStringInfo, 16> EncInfos;
   for (auto *GV : StringGlobals) {
-    encryptGlobalString(M, *GV);
+    EncInfos.push_back(encryptGlobalString(M, *GV));
     Changed = true;
   }
+
+  // main() 전에 모든 문자열을 복호화하는 생성자 함수 생성
+  if (Changed)
+    generateDecryptorCtor(M, EncInfos);
 
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
@@ -43,16 +49,15 @@ static void insertAntiPredictionJunk(Function *F, IRBuilder<> &Builder,
   auto *JunkVar = AllocaBuilder.CreateAlloca(Int32Ty, nullptr, "kld.junk");
 
   // 현재 위치에 volatile store/load 삽입
-  auto *Store =
-      Builder.CreateStore(ConstantInt::get(Int32Ty, Rng()), JunkVar);
+  Builder.CreateStore(ConstantInt::get(Int32Ty, Rng()), JunkVar);
   auto *Load = Builder.CreateLoad(Int32Ty, JunkVar, "kld.j");
   cast<LoadInst>(Load)->setVolatile(true);
   // 결과를 사용하지 않으면 제거되므로, dummy xor
   Builder.CreateXor(Load, ConstantInt::get(Int32Ty, Rng()));
 }
 
-void StringEncryptionPass::encryptGlobalString(Module &M,
-                                               GlobalVariable &GV) {
+StringEncryptionPass::EncryptedStringInfo
+StringEncryptionPass::encryptGlobalString(Module &M, GlobalVariable &GV) {
   auto *Init = cast<ConstantDataArray>(GV.getInitializer());
   StringRef OrigStr = Init->getAsString();
 
@@ -67,12 +72,14 @@ void StringEncryptionPass::encryptGlobalString(Module &M,
     Encrypted[I] = static_cast<uint8_t>(OrigStr[I]) ^ K;
   }
 
+  uint64_t StrSize = OrigStr.size();
+
   auto *NewInit =
       ConstantDataArray::get(M.getContext(), ArrayRef<uint8_t>(Encrypted));
   GV.setInitializer(NewInit);
   GV.setConstant(false);
 
-  // 힙 기반 지연 복호화 런타임 함수
+  // 인플레이스 복호화 런타임 함수 (원본 데이터를 직접 복호화)
   auto *PtrTy = PointerType::getUnqual(M.getContext());
   auto *Int8Ty = Type::getInt8Ty(M.getContext());
   auto *Int64Ty = Type::getInt64Ty(M.getContext());
@@ -81,80 +88,70 @@ void StringEncryptionPass::encryptGlobalString(Module &M,
       FunctionType::get(PtrTy, {PtrTy, Int8Ty, Int64Ty}, false);
   FunctionCallee DecFn = M.getOrInsertFunction("__kld_decrypt_lazy", DecFnTy);
 
-  // 사용처 교체
+  // 사용처에 junk 연산 삽입 (정적 분석 방해)
+  // 생성자가 이미 복호화하므로 이 호출은 캐시 히트 + 난독화 역할
   SmallVector<User *, 8> Users(GV.users());
   for (auto *U : Users) {
+    Instruction *Target = nullptr;
+
     if (auto *CE = dyn_cast<ConstantExpr>(U)) {
-      SmallVector<User *, 4> CEUsers(CE->users());
-      for (auto *CEUser : CEUsers) {
+      // ConstantExpr의 Instruction 사용자 중 첫 번째를 찾아 junk 삽입
+      for (auto *CEUser : CE->users()) {
         if (auto *I = dyn_cast<Instruction>(CEUser)) {
-          if (!I->getFunction())
-            continue;
-          IRBuilder<> Builder(I);
-
-          // 복원 코드 예측 공격 방지: junk 연산 삽입
-          insertAntiPredictionJunk(I->getFunction(), Builder, Rng);
-
-          Value *DecPtr = Builder.CreateCall(
-              DecFn,
-              {Builder.CreatePointerCast(&GV, PtrTy), Builder.getInt8(Key),
-               Builder.getInt64(OrigStr.size())});
-
-          if (CE->getOpcode() == Instruction::GetElementPtr) {
-            SmallVector<Value *, 4> Indices;
-            for (unsigned Idx = 1; Idx < CE->getNumOperands(); ++Idx)
-              Indices.push_back(CE->getOperand(Idx));
-            Value *NewGEP = Builder.CreateInBoundsGEP(Int8Ty, DecPtr, Indices);
-            I->replaceUsesOfWith(CE, NewGEP);
-          } else {
-            I->replaceUsesOfWith(CE, DecPtr);
-          }
-        }
-      }
-    } else if (auto *GVUser = dyn_cast<GlobalVariable>(U)) {
-      // 포인터 전역변수 처리 (예: const char *secret = "hello")
-      // GVUser는 암호화된 문자열을 가리키는 포인터 전역변수
-      SmallVector<User *, 4> PtrUsers(GVUser->users());
-      for (auto *PU : PtrUsers) {
-        if (auto *LI = dyn_cast<LoadInst>(PU)) {
-          if (!LI->getFunction())
-            continue;
-          IRBuilder<> Builder(LI->getNextNode());
-          insertAntiPredictionJunk(LI->getFunction(), Builder, Rng);
-          Value *DecPtr = Builder.CreateCall(
-              DecFn,
-              {LI, Builder.getInt8(Key), Builder.getInt64(OrigStr.size())});
-          // LI의 모든 사용처를 DecPtr로 교체 (DecPtr 자체의 인자는 복원)
-          LI->replaceAllUsesWith(DecPtr);
-          cast<CallInst>(DecPtr)->setArgOperand(0, LI);
-        } else if (auto *CE = dyn_cast<ConstantExpr>(PU)) {
-          SmallVector<User *, 4> CEUsers(CE->users());
-          for (auto *CEUser : CEUsers) {
-            if (auto *LI = dyn_cast<LoadInst>(CEUser)) {
-              if (!LI->getFunction())
-                continue;
-              IRBuilder<> Builder(LI->getNextNode());
-              insertAntiPredictionJunk(LI->getFunction(), Builder, Rng);
-              Value *DecPtr = Builder.CreateCall(
-                  DecFn, {LI, Builder.getInt8(Key),
-                          Builder.getInt64(OrigStr.size())});
-              LI->replaceAllUsesWith(DecPtr);
-              cast<CallInst>(DecPtr)->setArgOperand(0, LI);
-            }
+          if (I->getFunction()) {
+            Target = I;
+            break;
           }
         }
       }
     } else if (auto *I = dyn_cast<Instruction>(U)) {
-      IRBuilder<> Builder(I);
+      if (I->getFunction())
+        Target = I;
+    }
 
-      insertAntiPredictionJunk(I->getFunction(), Builder, Rng);
+    // 사용처에 junk 연산만 삽입 (사용처 교체 없이 — 생성자가 인플레이스 복호화)
+    if (Target) {
+      IRBuilder<> Builder(Target);
+      insertAntiPredictionJunk(Target->getFunction(), Builder, Rng);
 
-      Value *DecPtr = Builder.CreateCall(
+      // 더미 decrypt 호출 (캐시 히트, 분석 혼란 용도)
+      Builder.CreateCall(
           DecFn, {Builder.CreatePointerCast(&GV, PtrTy), Builder.getInt8(Key),
-                  Builder.getInt64(OrigStr.size())});
-      I->replaceUsesOfWith(&GV, DecPtr);
+                  Builder.getInt64(StrSize)});
     }
   }
+
+  return {&GV, Key, StrSize};
+}
+
+void StringEncryptionPass::generateDecryptorCtor(
+    Module &M, ArrayRef<EncryptedStringInfo> Infos) {
+  auto *PtrTy = PointerType::getUnqual(M.getContext());
+  auto *Int8Ty = Type::getInt8Ty(M.getContext());
+  auto *Int64Ty = Type::getInt64Ty(M.getContext());
+  auto *VoidTy = Type::getVoidTy(M.getContext());
+
+  FunctionType *DecFnTy =
+      FunctionType::get(PtrTy, {PtrTy, Int8Ty, Int64Ty}, false);
+  FunctionCallee DecFn = M.getOrInsertFunction("__kld_decrypt_lazy", DecFnTy);
+
+  // 생성자 함수: main() 전에 실행되어 모든 문자열을 인플레이스 복호화
+  FunctionType *CtorTy = FunctionType::get(VoidTy, false);
+  Function *Ctor = Function::Create(CtorTy, GlobalValue::InternalLinkage,
+                                    "__kld_init_strings", M);
+  BasicBlock *BB = BasicBlock::Create(M.getContext(), "entry", Ctor);
+  IRBuilder<> Builder(BB);
+
+  for (auto &Info : Infos) {
+    Builder.CreateCall(DecFn,
+                       {Builder.CreatePointerCast(Info.GV, PtrTy),
+                        Builder.getInt8(Info.Key),
+                        Builder.getInt64(Info.Size)});
+  }
+  Builder.CreateRetVoid();
+
+  // llvm.global_ctors에 등록 (우선순위 0 = 가장 먼저 실행)
+  appendToGlobalCtors(M, Ctor, 0);
 }
 
 } // namespace orknew

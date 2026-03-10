@@ -11,9 +11,11 @@ using namespace llvm;
 
 namespace orknew {
 
+// 단일 switch에 넣을 최대 BB 수 — 레지스터 할당기 안정성 보장
+static constexpr unsigned MaxCasesPerSwitch = 80;
+
 PreservedAnalyses
 ControlFlowFlatteningPass::run(Function &F, FunctionAnalysisManager &AM) {
-  // 선언, 아주 작은 함수는 스킵 (작은 함수는 CFF 오버헤드가 보안 이득보다 큼)
   if (F.isDeclaration() || F.size() <= 4)
     return PreservedAnalyses::all();
 
@@ -61,9 +63,7 @@ static void demoteCrossBBRegisters(Function &F) {
     DemoteRegToStack(*I);
 }
 
-// 자동화 예측 공격 방지: opaque predicate 삽입
-// 항상 참이지만 정적 분석으로 판별하기 어려운 조건문
-// 패턴을 랜덤 선택하여 분석 도구의 패턴 매칭을 방해
+// opaque predicate 삽입 (자동화 예측 공격 방지)
 static Value *createOpaquePredicate(IRBuilder<> &Builder, Function &F,
                                     std::mt19937 &Rng) {
   auto *Int32Ty = Type::getInt32Ty(F.getContext());
@@ -74,21 +74,18 @@ static Value *createOpaquePredicate(IRBuilder<> &Builder, Function &F,
   int Pattern = Rng() % 3;
   switch (Pattern) {
   case 0: {
-    // x*(x+1) % 2 == 0 (연속 정수 곱은 항상 짝수)
     Value *XPlus1 = Builder.CreateAdd(X, ConstantInt::get(Int32Ty, 1));
     Value *Mul = Builder.CreateMul(X, XPlus1);
     Value *Mod = Builder.CreateAnd(Mul, ConstantInt::get(Int32Ty, 1));
     return Builder.CreateICmpEQ(Mod, ConstantInt::get(Int32Ty, 0));
   }
   case 1: {
-    // (x^2 + x) % 2 == 0 (x^2+x = x(x+1)이므로 항상 짝수)
     Value *Sq = Builder.CreateMul(X, X);
     Value *Sum = Builder.CreateAdd(Sq, X);
     Value *Mod = Builder.CreateAnd(Sum, ConstantInt::get(Int32Ty, 1));
     return Builder.CreateICmpEQ(Mod, ConstantInt::get(Int32Ty, 0));
   }
   default: {
-    // (x | ~x) == -1 (항상 참: 모든 비트가 1)
     Value *NotX = Builder.CreateNot(X);
     Value *OrVal = Builder.CreateOr(X, NotX);
     return Builder.CreateICmpEQ(OrVal, ConstantInt::get(Int32Ty, -1));
@@ -96,28 +93,11 @@ static Value *createOpaquePredicate(IRBuilder<> &Builder, Function &F,
   }
 }
 
-// cross-BB SSA 값 개수 세기 (CFF 적용 가능 여부 판단용)
-static unsigned countCrossBBValues(Function &F) {
-  unsigned Count = 0;
-  for (auto &BB : F)
-    for (auto &I : BB) {
-      if (I.isTerminator() || isa<AllocaInst>(&I) || I.getType()->isVoidTy())
-        continue;
-      for (auto *U : I.users())
-        if (auto *UI = dyn_cast<Instruction>(U))
-          if (UI->getParent() != &BB) {
-            Count++;
-            break;
-          }
-    }
-  return Count;
-}
-
 void ControlFlowFlatteningPass::flatten(Function &F) {
   // 0. PHI 노드를 alloca로 변환
   demotePhiNodes(F);
 
-  // 1. 엔트리 블록 분리
+  // 1. 엔트리 블록 분리 (alloca 이후)
   BasicBlock &EntryBB = F.getEntryBlock();
   auto SplitIt = EntryBB.begin();
   while (SplitIt != EntryBB.end() && isa<AllocaInst>(&*SplitIt))
@@ -127,8 +107,11 @@ void ControlFlowFlatteningPass::flatten(Function &F) {
 
   BasicBlock *FirstBB = EntryBB.splitBasicBlock(SplitIt, "entry.split");
 
-  // 2. 평탄화 대상 블록 수집
-  SmallVector<BasicBlock *, 16> OrigBBs;
+  // 2. cross-BB SSA 값을 alloca로 변환
+  demoteCrossBBRegisters(F);
+
+  // 3. BB 수집 (demotion이 새 BB를 만들 수 있으므로 다시 수집)
+  SmallVector<BasicBlock *, 64> OrigBBs;
   for (auto &BB : F) {
     if (&BB == &EntryBB)
       continue;
@@ -138,13 +121,11 @@ void ControlFlowFlatteningPass::flatten(Function &F) {
   if (OrigBBs.size() <= 1)
     return;
 
-  // 3. 각 블록에 밀집 case 번호 할당 (랜덤 순열)
-  // 밀집 범위 → LLVM 백엔드가 jump table 생성 → O(1) 디스패치
+  // 4. 각 블록에 밀집 case 번호 할당 (랜덤 순열)
   std::mt19937 Rng(std::random_device{}());
-  SmallVector<uint32_t, 16> CaseValues;
+  SmallVector<uint32_t, 64> CaseValues;
   for (unsigned I = 0; I < OrigBBs.size(); I++)
     CaseValues.push_back(I);
-  // Fisher-Yates 셔플로 비결정적 매핑
   for (unsigned I = CaseValues.size() - 1; I > 0; I--) {
     unsigned J = Rng() % (I + 1);
     std::swap(CaseValues[I], CaseValues[J]);
@@ -153,66 +134,100 @@ void ControlFlowFlatteningPass::flatten(Function &F) {
   for (unsigned I = 0; I < OrigBBs.size(); I++)
     BBToCase[OrigBBs[I]] = CaseValues[I];
 
-  // 4. switch 변수 + XOR 키 생성
-  // case 값을 XOR 인코딩하여 정적 분석 도구의 CFG 재구성을 방해
+  // 5. switch 변수 + XOR 키 생성
   auto *Int32Ty = Type::getInt32Ty(F.getContext());
   IRBuilder<> EntryBuilder(&EntryBB, EntryBB.begin());
   AllocaInst *SwitchVar =
       EntryBuilder.CreateAlloca(Int32Ty, nullptr, "kld.sw.var");
-  uint32_t XorKey = Rng() | 1; // 비결정적 XOR 키 (0이 아닌 값)
+  uint32_t XorKey = Rng() | 1;
 
-  // 인코딩된 초기 case 저장: real_case ^ key
-  new StoreInst(
-      ConstantInt::get(Int32Ty, BBToCase[FirstBB] ^ XorKey), SwitchVar,
-      EntryBB.getTerminator()->getIterator());
-
+  // 인코딩된 초기 case 저장
+  new StoreInst(ConstantInt::get(Int32Ty, BBToCase[FirstBB] ^ XorKey),
+                SwitchVar, EntryBB.getTerminator()->getIterator());
   EntryBB.getTerminator()->eraseFromParent();
 
-  // 5. dispatch 블록: load → XOR decode → switch
+  // 6. 메인 디스패치 블록: load → XOR decode
   BasicBlock *DispatchBB =
       BasicBlock::Create(F.getContext(), "kld.dispatch", &F, FirstBB);
-  BasicBlock *DefaultBB =
-      BasicBlock::Create(F.getContext(), "kld.default", &F);
-  new UnreachableInst(F.getContext(), DefaultBB);
-
   BranchInst::Create(DispatchBB, &EntryBB);
 
   IRBuilder<> DispatchBuilder(DispatchBB);
   LoadInst *Load = DispatchBuilder.CreateLoad(Int32Ty, SwitchVar, "kld.sw");
-  Load->setVolatile(true); // 최적화기 제거 방지 필수
-  // XOR 디코딩: 저장된 (case ^ key)를 원래 case로 복원
+  Load->setVolatile(true);
   Value *Decoded =
       DispatchBuilder.CreateXor(Load, ConstantInt::get(Int32Ty, XorKey));
 
-  SwitchInst *Switch =
-      DispatchBuilder.CreateSwitch(Decoded, DefaultBB, OrigBBs.size());
+  // 7. BB들을 case 값 범위로 청크 분할
+  unsigned NumChunks =
+      (OrigBBs.size() + MaxCasesPerSwitch - 1) / MaxCasesPerSwitch;
 
-  // switch case 값은 디코딩된(원래) 값 사용
-  for (auto *BB : OrigBBs)
-    Switch->addCase(ConstantInt::get(Int32Ty, BBToCase[BB]), BB);
+  // 각 청크에 속하는 BB 그룹화 (case 값 범위 기준)
+  SmallVector<SmallVector<BasicBlock *, 64>, 4> ChunkBBs(NumChunks);
+  for (auto *BB : OrigBBs) {
+    unsigned ChunkIdx = BBToCase[BB] / MaxCasesPerSwitch;
+    ChunkBBs[ChunkIdx].push_back(BB);
+  }
 
-  // 6. 자동화 예측 공격 방지: bogus BB 삽입
-  // 가짜 블록을 추가하여 분석기가 실제 경로와 구분하기 어렵게 만듦
-  for (int I = 0; I < 3; I++) {
-    BasicBlock *BogusBB =
-        BasicBlock::Create(F.getContext(), "", &F);
+  // 8. 체인형 디스패치 구축
+  // dispatch → [chunk0 cases, default→sub1]
+  // sub1    → [chunk1 cases, default→sub2]
+  // ...
+  // subN    → [chunkN cases, default→unreachable]
+  // 모든 BB가 평탄화됨 — 각 switch는 최대 MaxCasesPerSwitch개 case
+
+  BasicBlock *DefaultBB =
+      BasicBlock::Create(F.getContext(), "kld.default", &F);
+  new UnreachableInst(F.getContext(), DefaultBB);
+
+  // 서브 디스패치 BB 생성 (chunk 1부터 — chunk 0은 DispatchBB 사용)
+  SmallVector<BasicBlock *, 8> SubDispatchBBs;
+  for (unsigned C = 1; C < NumChunks; C++) {
+    auto *SubBB =
+        BasicBlock::Create(F.getContext(), "kld.sub", &F);
+    SubDispatchBBs.push_back(SubBB);
+  }
+
+  // 각 청크의 switch 생성
+  for (unsigned C = 0; C < NumChunks; C++) {
+    // 이 청크의 default (fallthrough) 대상
+    BasicBlock *Fallthrough;
+    if (C + 1 < NumChunks)
+      Fallthrough = SubDispatchBBs[C]; // C=0 → SubDispatchBBs[0] = sub1
+    else
+      Fallthrough = DefaultBB; // 마지막 청크
+
+    SwitchInst *Switch;
+    if (C == 0) {
+      // 첫 번째 청크: DispatchBB에 switch 생성
+      Switch = DispatchBuilder.CreateSwitch(Decoded, Fallthrough,
+                                            ChunkBBs[C].size());
+    } else {
+      // 후속 청크: 서브 디스패치 BB에 switch 생성
+      // Decoded는 DispatchBB에서 정의, 여기서도 사용 가능 (dominance 보장)
+      IRBuilder<> SubBuilder(SubDispatchBBs[C - 1]);
+      Switch = SubBuilder.CreateSwitch(Decoded, Fallthrough,
+                                       ChunkBBs[C].size());
+    }
+
+    for (auto *BB : ChunkBBs[C])
+      Switch->addCase(ConstantInt::get(Int32Ty, BBToCase[BB]), BB);
+
+    // 청크당 bogus BB 1개 삽입
+    BasicBlock *BogusBB = BasicBlock::Create(F.getContext(), "", &F);
     IRBuilder<> BogusBuilder(BogusBB);
-    // opaque predicate로 dispatch나 default로 분기
     Value *Opaque = createOpaquePredicate(BogusBuilder, F, Rng);
     BogusBuilder.CreateCondBr(Opaque, DispatchBB, DefaultBB);
-    // 밀집 범위 연속으로 bogus case 할당 (jump table 유지)
-    uint32_t BogusCase = OrigBBs.size() + I;
+    uint32_t BogusCase = OrigBBs.size() + C;
     Switch->addCase(ConstantInt::get(Int32Ty, BogusCase), BogusBB);
   }
 
-  // 7. BB 순서 맵 생성 (백엣지 감지용)
+  // 9. BB 순서 맵 (백엣지 감지용)
   DenseMap<BasicBlock *, unsigned> BBIndex;
   for (unsigned Idx = 0; Idx < OrigBBs.size(); Idx++)
     BBIndex[OrigBBs[Idx]] = Idx;
 
-  // 8. 각 블록의 terminator 수정
-  // 핵심 최적화: 루프 백엣지(현재 BB보다 이전 BB로의 분기)는
-  // 디스패치를 거치지 않고 직접 분기 유지 → 루프 성능 보호
+  // 10. 각 블록의 terminator 수정
+  // 모든 평탄화 BB는 DispatchBB(체인 최상단)로 점프
   for (auto *BB : OrigBBs) {
     Instruction *Term = BB->getTerminator();
     if (!Term)
@@ -243,10 +258,8 @@ void ControlFlowFlatteningPass::flatten(Function &F) {
         bool FalseIsBack =
             BBIndex.count(FalseBB) && BBIndex[FalseBB] <= CurIdx;
 
-        if (TrueIsBack || FalseIsBack) {
-          // 조건 분기에서 한쪽이라도 백엣지면 원래 분기 유지 (루프 보호)
+        if (TrueIsBack || FalseIsBack)
           continue;
-        }
 
         IRBuilder<> Builder(Br);
         Value *Cond = Br->getCondition();
@@ -261,7 +274,6 @@ void ControlFlowFlatteningPass::flatten(Function &F) {
       }
     }
   }
-
 }
 
 } // namespace orknew

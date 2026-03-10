@@ -30,7 +30,7 @@ PreservedAnalyses RelocationPass::run(Module &M, ModuleAnalysisManager &AM) {
   for (auto &F : M) {
     if (F.isDeclaration() || F.size() <= 2)
       continue;
-    if (F.getName().starts_with("__kld_"))
+    if (F.getName().starts_with("__kld_") || F.getName().starts_with("kld"))
       continue;
     if (!Config::getInstance().shouldObfuscate(F.getName()))
       continue;

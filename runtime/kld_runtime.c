@@ -31,16 +31,10 @@ static volatile kld_decrypt_fn kld_fn_table[] = {
 };
 
 static void *kld_decrypt_impl(uint8_t *encrypted, uint8_t key, size_t len) {
-  // 캐시 검색 (lock-free 읽기 시도)
-  for (int i = 0; i < kld_cache_count; i++) {
-    if (kld_cache[i].encrypted == encrypted)
-      return kld_cache[i].decrypted;
-  }
-
-  // 캐시 미스: 락 획득 후 재확인 (double-checked locking)
+  // 캐시 검색: 락 획득 후 안전하게 검색 (race condition 방지)
   pthread_mutex_lock(&kld_mutex);
 
-  // 다른 스레드가 이미 복호화했을 수 있으므로 재확인
+  // 캐시 검색
   for (int i = 0; i < kld_cache_count; i++) {
     if (kld_cache[i].encrypted == encrypted) {
       pthread_mutex_unlock(&kld_mutex);
@@ -55,10 +49,10 @@ static void *kld_decrypt_impl(uint8_t *encrypted, uint8_t key, size_t len) {
     return encrypted;
   }
 
-  // 복호화 루프 (의도적으로 단순 XOR 대신 약간의 변형 추가)
+  // 복호화 루프 (인덱스 기반 키 변형으로 바이트별 다른 키 사용)
   for (size_t i = 0; i < len; i++) {
     uint8_t k = key ^ (uint8_t)(i & 0xFF);
-    decrypted[i] = encrypted[i] ^ key; // 기본 XOR
+    decrypted[i] = encrypted[i] ^ k;
   }
 
   // 캐시 등록

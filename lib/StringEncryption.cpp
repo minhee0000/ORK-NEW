@@ -60,10 +60,12 @@ void StringEncryptionPass::encryptGlobalString(Module &M,
   std::mt19937 Rng(std::random_device{}());
   uint8_t Key = (Rng() % 254) + 1;
 
-  // 암호화
+  // 암호화 (인덱스 기반 키 변형 — 런타임 복호화와 동일한 방식)
   std::vector<uint8_t> Encrypted(OrigStr.size());
-  for (size_t I = 0; I < OrigStr.size(); I++)
-    Encrypted[I] = static_cast<uint8_t>(OrigStr[I]) ^ Key;
+  for (size_t I = 0; I < OrigStr.size(); I++) {
+    uint8_t K = Key ^ static_cast<uint8_t>(I & 0xFF);
+    Encrypted[I] = static_cast<uint8_t>(OrigStr[I]) ^ K;
+  }
 
   auto *NewInit =
       ConstantDataArray::get(M.getContext(), ArrayRef<uint8_t>(Encrypted));
@@ -86,6 +88,8 @@ void StringEncryptionPass::encryptGlobalString(Module &M,
       SmallVector<User *, 4> CEUsers(CE->users());
       for (auto *CEUser : CEUsers) {
         if (auto *I = dyn_cast<Instruction>(CEUser)) {
+          if (!I->getFunction())
+            continue;
           IRBuilder<> Builder(I);
 
           // 복원 코드 예측 공격 방지: junk 연산 삽입
@@ -104,6 +108,39 @@ void StringEncryptionPass::encryptGlobalString(Module &M,
             I->replaceUsesOfWith(CE, NewGEP);
           } else {
             I->replaceUsesOfWith(CE, DecPtr);
+          }
+        }
+      }
+    } else if (auto *GVUser = dyn_cast<GlobalVariable>(U)) {
+      // 포인터 전역변수 처리 (예: const char *secret = "hello")
+      // GVUser는 암호화된 문자열을 가리키는 포인터 전역변수
+      SmallVector<User *, 4> PtrUsers(GVUser->users());
+      for (auto *PU : PtrUsers) {
+        if (auto *LI = dyn_cast<LoadInst>(PU)) {
+          if (!LI->getFunction())
+            continue;
+          IRBuilder<> Builder(LI->getNextNode());
+          insertAntiPredictionJunk(LI->getFunction(), Builder, Rng);
+          Value *DecPtr = Builder.CreateCall(
+              DecFn,
+              {LI, Builder.getInt8(Key), Builder.getInt64(OrigStr.size())});
+          // LI의 모든 사용처를 DecPtr로 교체 (DecPtr 자체의 인자는 복원)
+          LI->replaceAllUsesWith(DecPtr);
+          cast<CallInst>(DecPtr)->setArgOperand(0, LI);
+        } else if (auto *CE = dyn_cast<ConstantExpr>(PU)) {
+          SmallVector<User *, 4> CEUsers(CE->users());
+          for (auto *CEUser : CEUsers) {
+            if (auto *LI = dyn_cast<LoadInst>(CEUser)) {
+              if (!LI->getFunction())
+                continue;
+              IRBuilder<> Builder(LI->getNextNode());
+              insertAntiPredictionJunk(LI->getFunction(), Builder, Rng);
+              Value *DecPtr = Builder.CreateCall(
+                  DecFn, {LI, Builder.getInt8(Key),
+                          Builder.getInt64(OrigStr.size())});
+              LI->replaceAllUsesWith(DecPtr);
+              cast<CallInst>(DecPtr)->setArgOperand(0, LI);
+            }
           }
         }
       }

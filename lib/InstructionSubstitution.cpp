@@ -1,4 +1,5 @@
 #include "Obfuscation/InstructionSubstitution.h"
+#include "Obfuscation/Config.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include <random>
@@ -94,6 +95,10 @@ PreservedAnalyses
 InstructionSubstitutionPass::run(Function &F, FunctionAnalysisManager &AM) {
   if (F.isDeclaration() || F.getName().starts_with("__kld_") ||
       F.getName().starts_with("kld"))
+    return PreservedAnalyses::all();
+
+  if (!Config::getInstance().isPassEnabled("InstructionSubstitution",
+                                           F.getName()))
     return PreservedAnalyses::all();
 
   std::mt19937 Rng(std::random_device{}());

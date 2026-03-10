@@ -1,5 +1,7 @@
 # ORK-NEW
 
+[한국어](README.ko.md)
+
 LLVM-based code obfuscation compiler plugin
 
 Applies multi-layered obfuscation to hinder binary reverse engineering. Built as an out-of-tree plugin on LLVM's New Pass Manager, supporting all Clang-compiled languages (C, C++, Objective-C).

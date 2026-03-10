@@ -1,0 +1,16 @@
+build/
+*.dylib
+*.o
+*.a
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+cmake-build-*/
+CLAUDE.md
+test/test_full
+test/test_normal
+test/test_obfuscated
+test/test_obfuscated_O1

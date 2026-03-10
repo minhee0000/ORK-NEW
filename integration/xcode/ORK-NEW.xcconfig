@@ -1,0 +1,35 @@
+// ORK-NEW Obfuscation - Xcode Build Configuration
+// 사용법: Xcode 프로젝트 > Build Settings > + > Add User-Defined Setting
+// 또는 프로젝트의 .xcconfig에 #include 하여 사용
+//
+// 1. 프로젝트 설정에서 이 파일을 Configuration으로 지정
+// 2. ORK_NEW_ENABLED = YES 로 설정하면 난독화 활성화
+
+// 난독화 활성화 여부 (YES / NO)
+ORK_NEW_ENABLED = YES
+
+// ORK-NEW.dylib 경로 (설치 경로에 맞게 수정)
+ORK_NEW_LIB_PATH = $(SRCROOT)/ORK-NEW/build/ORK-NEW.dylib
+
+// 설정 파일 경로 (선택)
+ORK_NEW_CONFIG_PATH =
+
+// LLVM clang 경로 (brew 설치 기준)
+ORK_NEW_CLANG_PATH = /opt/homebrew/opt/llvm/bin
+
+// === 컴파일러 플래그 주입 ===
+ORK_NEW_FLAGS = -fpass-plugin=$(ORK_NEW_LIB_PATH)
+ORK_NEW_CONFIG_FLAGS = -mllvm -kld-config=$(ORK_NEW_CONFIG_PATH)
+
+// 활성화 시 OTHER_CFLAGS에 추가
+OTHER_CFLAGS_ORK_NEW_YES = $(ORK_NEW_FLAGS)
+OTHER_CFLAGS_ORK_NEW_NO =
+OTHER_CFLAGS = $(inherited) $(OTHER_CFLAGS_ORK_NEW_$(ORK_NEW_ENABLED))
+
+// C++ 플래그도 동일 적용
+OTHER_CPLUSPLUSFLAGS = $(inherited) $(OTHER_CFLAGS_ORK_NEW_$(ORK_NEW_ENABLED))
+
+// LLVM clang 사용 (Apple Clang은 외부 pass plugin 미지원)
+CC = $(ORK_NEW_CLANG_PATH)/clang
+CPLUSPLUS = $(ORK_NEW_CLANG_PATH)/clang++
+LDPLUSPLUS = $(ORK_NEW_CLANG_PATH)/clang++

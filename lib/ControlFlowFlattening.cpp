@@ -42,25 +42,32 @@ static void demotePhiNodes(Function &F) {
 }
 
 // CFF가 도미넌스를 깨뜨리므로, BB를 넘는 SSA 값을 alloca로 변환
+// 반복 수행: 디모션이 새 교차-BB 참조를 만들 수 있으므로 수렴까지 반복
 static void demoteCrossBBRegisters(Function &F) {
-  SmallVector<Instruction *, 64> ToDemote;
+  for (int Round = 0; Round < 10; Round++) {
+    SmallVector<Instruction *, 64> ToDemote;
 
-  for (auto &BB : F) {
-    for (auto &I : BB) {
-      if (I.isTerminator() || isa<AllocaInst>(&I) || I.getType()->isVoidTy())
-        continue;
-      for (auto *U : I.users()) {
-        if (auto *UI = dyn_cast<Instruction>(U)) {
-          if (UI->getParent() != &BB) {
-            ToDemote.push_back(&I);
-            break;
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        if (I.isTerminator() || isa<AllocaInst>(&I) || I.getType()->isVoidTy())
+          continue;
+        for (auto *U : I.users()) {
+          if (auto *UI = dyn_cast<Instruction>(U)) {
+            if (UI->getParent() != &BB) {
+              ToDemote.push_back(&I);
+              break;
+            }
           }
         }
       }
     }
+
+    if (ToDemote.empty())
+      break;
+
+    for (auto *I : ToDemote)
+      DemoteRegToStack(*I);
   }
-  for (auto *I : ToDemote)
-    DemoteRegToStack(*I);
 }
 
 // opaque predicate 삽입 (자동화 예측 공격 방지)
@@ -143,7 +150,8 @@ void ControlFlowFlatteningPass::flatten(Function &F) {
 
   // 인코딩된 초기 case 저장
   new StoreInst(ConstantInt::get(Int32Ty, BBToCase[FirstBB] ^ XorKey),
-                SwitchVar, EntryBB.getTerminator()->getIterator());
+                SwitchVar, /*isVolatile=*/true,
+                EntryBB.getTerminator()->getIterator());
   EntryBB.getTerminator()->eraseFromParent();
 
   // 6. 메인 디스패치 블록: load → XOR decode
@@ -245,7 +253,7 @@ void ControlFlowFlatteningPass::flatten(Function &F) {
           continue;
         new StoreInst(
             ConstantInt::get(Int32Ty, BBToCase[Succ] ^ XorKey), SwitchVar,
-            Br->getIterator());
+            /*isVolatile=*/true, Br->getIterator());
         Br->setSuccessor(0, DispatchBB);
       } else {
         BasicBlock *TrueBB = Br->getSuccessor(0);
@@ -271,6 +279,33 @@ void ControlFlowFlatteningPass::flatten(Function &F) {
         new StoreInst(Selected, SwitchVar, /*isVolatile=*/true,
                       Br->getIterator());
         ReplaceInstWithInst(Br, BranchInst::Create(DispatchBB));
+      }
+    } else if (auto *SI = dyn_cast<SwitchInst>(Term)) {
+      // SwitchInst 처리: 각 successor를 dispatch를 통하도록 리다이렉트
+      // 각 case에 대해 중간 BB 생성 (store case value → dispatch)
+      Value *Cond = SI->getCondition();
+      BasicBlock *DefDest = SI->getDefaultDest();
+
+      // default에 대한 스토어 BB 생성
+      if (BBToCase.count(DefDest)) {
+        BasicBlock *StoreBB =
+            BasicBlock::Create(F.getContext(), "", &F, DispatchBB);
+        new StoreInst(ConstantInt::get(Int32Ty, BBToCase[DefDest] ^ XorKey),
+                      SwitchVar, /*isVolatile=*/true, StoreBB);
+        BranchInst::Create(DispatchBB, StoreBB);
+        SI->setDefaultDest(StoreBB);
+      }
+
+      for (auto Case : SI->cases()) {
+        BasicBlock *Succ = Case.getCaseSuccessor();
+        if (!BBToCase.count(Succ))
+          continue;
+        BasicBlock *StoreBB =
+            BasicBlock::Create(F.getContext(), "", &F, DispatchBB);
+        new StoreInst(ConstantInt::get(Int32Ty, BBToCase[Succ] ^ XorKey),
+                      SwitchVar, /*isVolatile=*/true, StoreBB);
+        BranchInst::Create(DispatchBB, StoreBB);
+        Case.setSuccessor(StoreBB);
       }
     }
   }

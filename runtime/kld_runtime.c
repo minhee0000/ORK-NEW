@@ -4,7 +4,8 @@
 #include <pthread.h>
 
 // === 인플레이스 복호화 + 스레드 안전 캐시 ===
-#define KLD_CACHE_SIZE 1024
+// 충분히 큰 정적 캐시 (동적 할당 없음, 생성자에서 안전)
+#define KLD_CACHE_SIZE 16384
 
 typedef struct {
   const uint8_t *data;  // 복호화 완료된 데이터 주소 (원본 위치)

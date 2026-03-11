@@ -79,9 +79,8 @@ PreservedAnalyses ConstantObfuscationPass::run(Function &F,
   SmallVector<std::pair<Instruction *, unsigned>, 64> Targets;
   for (auto &BB : F) {
     for (auto &I : BB) {
-      if (isa<AllocaInst>(&I) || isa<PHINode>(&I) || I.isTerminator())
-        continue;
-      if (isa<CallInst>(&I) || isa<InvokeInst>(&I))
+      // 안전한 명령어만 대상: 이진 연산 + 비교
+      if (!isa<BinaryOperator>(&I) && !isa<ICmpInst>(&I))
         continue;
       for (unsigned OpIdx = 0; OpIdx < I.getNumOperands(); ++OpIdx) {
         if (auto *CI = dyn_cast<ConstantInt>(I.getOperand(OpIdx))) {

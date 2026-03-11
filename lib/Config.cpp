@@ -32,6 +32,10 @@ bool Config::isPassEnabled(llvm::StringRef PassName,
   return shouldObfuscate(FuncName);
 }
 
+bool Config::isPassEnabled(llvm::StringRef PassName) const {
+  return !DisabledPasses.count(PassName);
+}
+
 void Config::loadFromFile(llvm::StringRef Path) {
   auto BufOrErr = llvm::MemoryBuffer::getFile(Path);
   if (!BufOrErr) {

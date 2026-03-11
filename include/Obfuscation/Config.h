@@ -19,6 +19,9 @@ public:
   bool isPassEnabled(llvm::StringRef PassName,
                      llvm::StringRef FuncName) const;
 
+  // 패스가 전역적으로 활성화되어 있는지 확인 (모듈 패스용)
+  bool isPassEnabled(llvm::StringRef PassName) const;
+
   // 설정 파일 로드
   void loadFromFile(llvm::StringRef Path);
 

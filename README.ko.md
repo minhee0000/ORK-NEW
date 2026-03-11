@@ -31,11 +31,12 @@ ninja
 ## 사용법
 
 ```bash
-# 기본 컴파일
-clang -O1 -fpass-plugin=path/to/ORK-NEW.dylib source.c -o output
+# 기본 컴파일 (문자열 암호화 런타임 포함)
+clang -O1 -fpass-plugin=path/to/ORK-NEW.dylib source.c runtime/kld_runtime.c -lpthread -o output
 
-# 문자열 암호화 사용 시 런타임 링크 필수
-clang -O1 -fpass-plugin=path/to/ORK-NEW.dylib source.c runtime/kld_runtime.c -o output
+# 문자열 암호화 비활성화 시
+clang -O1 -fpass-plugin=path/to/ORK-NEW.dylib -mllvm -kld-config=no_strenc.conf source.c -o output
+# no_strenc.conf: disable: StringEncryption
 ```
 
 ## 설정

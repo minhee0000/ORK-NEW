@@ -33,11 +33,12 @@ Output: `build/ORK-NEW.dylib`
 ## Usage
 
 ```bash
-# Basic compilation
-clang -O1 -fpass-plugin=path/to/ORK-NEW.dylib source.c -o output
+# Standard compilation (includes string encryption runtime)
+clang -O1 -fpass-plugin=path/to/ORK-NEW.dylib source.c runtime/kld_runtime.c -lpthread -o output
 
-# With string encryption (requires runtime linkage)
-clang -O1 -fpass-plugin=path/to/ORK-NEW.dylib source.c runtime/kld_runtime.c -o output
+# Without string encryption
+clang -O1 -fpass-plugin=path/to/ORK-NEW.dylib -mllvm -kld-config=no_strenc.conf source.c -o output
+# no_strenc.conf: disable: StringEncryption
 ```
 
 ## Configuration

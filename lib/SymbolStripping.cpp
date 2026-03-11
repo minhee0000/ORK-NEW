@@ -18,6 +18,9 @@ static bool isRTTISymbol(StringRef Name) {
 
 PreservedAnalyses SymbolStrippingPass::run(Module &M,
                                            ModuleAnalysisManager &AM) {
+  if (!Config::getInstance().isPassEnabled("SymbolStripping"))
+    return PreservedAnalyses::all();
+
   bool Changed = false;
   std::mt19937 Rng(std::random_device{}());
 

@@ -10,6 +10,9 @@ using namespace llvm;
 namespace orknew {
 
 PreservedAnalyses RelocationPass::run(Module &M, ModuleAnalysisManager &AM) {
+  if (!Config::getInstance().isPassEnabled("Relocation"))
+    return PreservedAnalyses::all();
+
   std::mt19937 Rng(std::random_device{}());
 
   // 1. 함수 순서 셔플

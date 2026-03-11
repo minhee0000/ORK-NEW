@@ -12,6 +12,9 @@ namespace orknew {
 
 PreservedAnalyses StringEncryptionPass::run(Module &M,
                                             ModuleAnalysisManager &AM) {
+  if (!Config::getInstance().isPassEnabled("StringEncryption"))
+    return PreservedAnalyses::all();
+
   bool Changed = false;
 
   SmallVector<GlobalVariable *, 16> StringGlobals;

@@ -40,25 +40,6 @@ PreservedAnalyses StringEncryptionPass::run(Module &M,
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
-// 복원 코드 예측 공격 방지: 복호화 호출 전후에 가짜 연산 삽입
-// 엔트리 블록에 alloca를 배치하여 IR 규칙 준수
-static void insertAntiPredictionJunk(Function *F, IRBuilder<> &Builder,
-                                     std::mt19937 &Rng) {
-  auto *Int32Ty = Type::getInt32Ty(F->getContext());
-
-  // alloca는 엔트리 블록에 삽입
-  IRBuilder<> AllocaBuilder(&F->getEntryBlock(),
-                            F->getEntryBlock().getFirstInsertionPt());
-  auto *JunkVar = AllocaBuilder.CreateAlloca(Int32Ty, nullptr, "kld.junk");
-
-  // 현재 위치에 volatile store/load 삽입
-  Builder.CreateStore(ConstantInt::get(Int32Ty, Rng()), JunkVar);
-  auto *Load = Builder.CreateLoad(Int32Ty, JunkVar, "kld.j");
-  cast<LoadInst>(Load)->setVolatile(true);
-  // 결과를 사용하지 않으면 제거되므로, dummy xor
-  Builder.CreateXor(Load, ConstantInt::get(Int32Ty, Rng()));
-}
-
 StringEncryptionPass::EncryptedStringInfo
 StringEncryptionPass::encryptGlobalString(Module &M, GlobalVariable &GV) {
   auto *Init = cast<ConstantDataArray>(GV.getInitializer());
@@ -82,48 +63,7 @@ StringEncryptionPass::encryptGlobalString(Module &M, GlobalVariable &GV) {
   GV.setInitializer(NewInit);
   GV.setConstant(false);
 
-  // 인플레이스 복호화 런타임 함수 (원본 데이터를 직접 복호화)
-  auto *PtrTy = PointerType::getUnqual(M.getContext());
-  auto *Int8Ty = Type::getInt8Ty(M.getContext());
-  auto *Int64Ty = Type::getInt64Ty(M.getContext());
-
-  FunctionType *DecFnTy =
-      FunctionType::get(PtrTy, {PtrTy, Int8Ty, Int64Ty}, false);
-  FunctionCallee DecFn = M.getOrInsertFunction("__kld_decrypt_lazy", DecFnTy);
-
-  // 사용처에 junk 연산 삽입 (정적 분석 방해)
-  // 생성자가 이미 복호화하므로 이 호출은 캐시 히트 + 난독화 역할
-  SmallVector<User *, 8> Users(GV.users());
-  for (auto *U : Users) {
-    Instruction *Target = nullptr;
-
-    if (auto *CE = dyn_cast<ConstantExpr>(U)) {
-      // ConstantExpr의 Instruction 사용자 중 첫 번째를 찾아 junk 삽입
-      for (auto *CEUser : CE->users()) {
-        if (auto *I = dyn_cast<Instruction>(CEUser)) {
-          if (I->getFunction()) {
-            Target = I;
-            break;
-          }
-        }
-      }
-    } else if (auto *I = dyn_cast<Instruction>(U)) {
-      if (I->getFunction())
-        Target = I;
-    }
-
-    // 사용처에 junk 연산만 삽입 (사용처 교체 없이 — 생성자가 인플레이스 복호화)
-    if (Target) {
-      IRBuilder<> Builder(Target);
-      insertAntiPredictionJunk(Target->getFunction(), Builder, Rng);
-
-      // 더미 decrypt 호출 (캐시 히트, 분석 혼란 용도)
-      Builder.CreateCall(
-          DecFn, {Builder.CreatePointerCast(&GV, PtrTy), Builder.getInt8(Key),
-                  Builder.getInt64(StrSize)});
-    }
-  }
-
+  // 생성자가 인플레이스 복호화하므로 사용처 변경 불필요
   return {&GV, Key, StrSize};
 }
 

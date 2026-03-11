@@ -20,32 +20,34 @@ static Value *obfuscateConstant(IRBuilder<> &Builder, ConstantInt *CI,
   if (BitWidth > 64)
     return nullptr;
 
+  // 비트 마스크 (64비트 시프트 UB 방지)
+  uint64_t Mask = (BitWidth < 64) ? ((1ULL << BitWidth) - 1) : ~0ULL;
+
   // 여러 변환 패턴 중 랜덤 선택
   int Pattern = Rng() % 4;
 
   switch (Pattern) {
   case 0: {
     // val → (A ^ B) where A ^ B == val
-    uint64_t A = Rng() & ((1ULL << BitWidth) - 1);
+    uint64_t A = Rng() & Mask;
     uint64_t B = OrigVal ^ A;
     return Builder.CreateXor(ConstantInt::get(Ty, A), ConstantInt::get(Ty, B));
   }
   case 1: {
     // val → (A + B) where A + B == val
-    uint64_t A = Rng() & ((1ULL << BitWidth) - 1);
-    uint64_t B = (OrigVal - A) & ((1ULL << BitWidth) - 1);
+    uint64_t A = Rng() & Mask;
+    uint64_t B = (OrigVal - A) & Mask;
     return Builder.CreateAdd(ConstantInt::get(Ty, A), ConstantInt::get(Ty, B));
   }
   case 2: {
     // val → (A - B) where A - B == val
-    uint64_t B = Rng() & ((1ULL << BitWidth) - 1);
-    uint64_t A = (OrigVal + B) & ((1ULL << BitWidth) - 1);
+    uint64_t B = Rng() & Mask;
+    uint64_t A = (OrigVal + B) & Mask;
     return Builder.CreateSub(ConstantInt::get(Ty, A), ConstantInt::get(Ty, B));
   }
   case 3: {
     // val → ((A * B) + C) where (A * B + C) == val
     uint64_t A = (Rng() % 7) + 2; // 2~8
-    uint64_t Mask = (BitWidth < 64) ? ((1ULL << BitWidth) - 1) : ~0ULL;
     uint64_t Q = OrigVal / A;
     uint64_t C = OrigVal - (Q * A);
     Value *Mul =
